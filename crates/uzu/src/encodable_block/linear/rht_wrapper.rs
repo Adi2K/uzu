@@ -4,21 +4,19 @@ use std::{
     rc::Rc,
 };
 
-use half::bf16;
 use thiserror::Error;
 
 use super::{Linear, LinearBlockError, QuantizedLinear};
 use crate::{
     DataType,
-    array::{Array, ArrayContextExt},
     backends::common::{
         Backend, Encoder,
         kernel::{
-            HadamardTransformMulKernel, Kernels, QuantizedMatmulQmmTransposedOutputHadamardKernel,
-            QuantizedMatmulQmvFastOutputHadamardKernel, quant_matmul::QuantizedMatmulType,
+            HadamardTransformKernel, Kernels,
+            quant_matmul::{QuantizedMatmulArguments, QuantizedMatmulConfiguration, QuantizedMatmulKernelEncodable},
         },
     },
-    config::{LinearConfig, QuantizationConfig},
+    config::LinearConfig,
     forward_pass::state::{ArrayId, ForwardPassState},
     parameters::{ParameterLoaderError, ParameterTree},
 };
@@ -53,89 +51,32 @@ pub enum RHTLinearWrapperError<B: Backend> {
     },
 }
 
-struct OutputFusedDecodeKernel<B: Backend> {
-    kernel: <B::Kernels as Kernels>::QuantizedMatmulQmvFastOutputHadamardKernel,
+struct FusedOutputHadamardMatmul<B: Backend> {
+    kernel: QuantizedMatmulKernelEncodable<B>,
     weights_buffer: Rc<RefCell<B::Buffer>>,
     scales_buffer: Rc<RefCell<B::Buffer>>,
     zero_points_or_biases_buffer: Rc<RefCell<B::Buffer>>,
-    is_mlx_quant: bool,
-}
-
-struct PrefillFusedKernel<B: Backend> {
-    kernel: <B::Kernels as Kernels>::QuantizedMatmulQmmTransposedOutputHadamardKernel,
-    weights_buffer: Rc<RefCell<B::Buffer>>,
-    scales_buffer: Rc<RefCell<B::Buffer>>,
-    zero_points_or_biases_buffer: Rc<RefCell<B::Buffer>>,
-    is_mlx_quant: bool,
 }
 
 pub struct RHTLinearWrapper<B: Backend> {
     inner_linear: Box<dyn Linear<B>>,
-    input_hadamard: Option<(<B::Kernels as Kernels>::HadamardTransformMulKernel, Rc<RefCell<B::Buffer>>)>,
-    output_hadamard_kernel: <B::Kernels as Kernels>::HadamardTransformMulKernel,
-    output_factors_buffer: Rc<RefCell<B::Buffer>>,
+    input_hadamard: Option<(<B::Kernels as Kernels>::HadamardTransformKernel, B::Buffer)>,
+    output_hadamard_kernel: <B::Kernels as Kernels>::HadamardTransformKernel,
+    output_factors_buffer: B::Buffer,
     input_dimension: usize,
     output_dimension: usize,
     input_array_id: ArrayId,
     output_array_id: ArrayId,
-    output_fused: Option<OutputFusedDecodeKernel<B>>,
-    prefill_fused: Option<PrefillFusedKernel<B>>,
+    fused_output_hadamard: Option<FusedOutputHadamardMatmul<B>>,
 }
 
-fn quant_bits(config: &QuantizationConfig) -> i32 {
-    match config.weight_quantization_mode {
-        crate::backends::common::gpu_types::QuantizationMode::UINT4 => 4,
-        crate::backends::common::gpu_types::QuantizationMode::INT8
-        | crate::backends::common::gpu_types::QuantizationMode::UINT8 => 8,
-    }
-}
-
-fn try_create_output_fused_from_quantized<B: Backend>(
+fn try_create_fused_output_hadamard<B: Backend>(
     context: &B::Context,
     inner_config: &LinearConfig,
     quantized_linear: &QuantizedLinear<B>,
     input_dimension: usize,
     output_dimension: usize,
-) -> Option<OutputFusedDecodeKernel<B>> {
-    let quant_config = match inner_config {
-        LinearConfig::Quantized(q) | LinearConfig::MLXQuantized(q) => q,
-        _ => return None,
-    };
-
-    if output_dimension % 32 != 0 || input_dimension % 512 != 0 {
-        return None;
-    }
-
-    let kernel_data_type: DataType = quant_config.activation_precision.into();
-    let bits = quant_bits(quant_config);
-    let group_size = quant_config.group_size as i32;
-    let is_mlx_quant = matches!(quantized_linear.quantization_type(), QuantizedMatmulType::Mlx);
-
-    let kernel = <B::Kernels as Kernels>::QuantizedMatmulQmvFastOutputHadamardKernel::new(
-        context,
-        kernel_data_type,
-        group_size,
-        bits,
-        !is_mlx_quant,
-        is_mlx_quant,
-    )
-    .ok()?;
-
-    Some(OutputFusedDecodeKernel {
-        kernel,
-        weights_buffer: Rc::clone(quantized_linear.weights_buffer()),
-        scales_buffer: Rc::clone(quantized_linear.scales_buffer()),
-        zero_points_or_biases_buffer: Rc::clone(quantized_linear.zero_points_or_biases_buffer()),
-        is_mlx_quant,
-    })
-}
-
-fn try_create_prefill_fused_from_quantized<B: Backend>(
-    context: &B::Context,
-    inner_config: &LinearConfig,
-    quantized_linear: &QuantizedLinear<B>,
-    output_dimension: usize,
-) -> Option<PrefillFusedKernel<B>> {
+) -> Option<FusedOutputHadamardMatmul<B>> {
     let quant_config = match inner_config {
         LinearConfig::Quantized(q) | LinearConfig::MLXQuantized(q) => q,
         _ => return None,
@@ -145,27 +86,25 @@ fn try_create_prefill_fused_from_quantized<B: Backend>(
         return None;
     }
 
-    let kernel_data_type: DataType = quant_config.activation_precision.into();
-    let bits = quant_bits(quant_config);
-    let group_size = quant_config.group_size as i32;
-    let is_mlx_quant = matches!(quantized_linear.quantization_type(), QuantizedMatmulType::Mlx);
-
-    let kernel = <B::Kernels as Kernels>::QuantizedMatmulQmmTransposedOutputHadamardKernel::new(
+    let kernel = QuantizedMatmulKernelEncodable::new(
         context,
-        kernel_data_type,
-        group_size,
-        bits,
-        !is_mlx_quant,
-        is_mlx_quant,
+        QuantizedMatmulConfiguration {
+            data_type: quant_config.activation_precision.into(),
+            group_size: quant_config.group_size,
+            input_dim: input_dimension,
+            output_dim: output_dimension,
+            mode: quant_config.weight_quantization_mode,
+            quantization_type: quantized_linear.quantization_type(),
+            use_hadamard: true,
+        },
     )
     .ok()?;
 
-    Some(PrefillFusedKernel {
+    Some(FusedOutputHadamardMatmul {
         kernel,
         weights_buffer: Rc::clone(quantized_linear.weights_buffer()),
         scales_buffer: Rc::clone(quantized_linear.scales_buffer()),
         zero_points_or_biases_buffer: Rc::clone(quantized_linear.zero_points_or_biases_buffer()),
-        is_mlx_quant,
     })
 }
 
@@ -195,42 +134,38 @@ impl<B: Backend> RHTLinearWrapper<B> {
 
         let kernel_data_type: DataType = inner_config.activation_precision().into();
 
-        let input_factors_raw =
-            parameter_tree.leaf_array("input_factors").map_err(RHTLinearWrapperError::ParameterError)?;
+        let input_factors_leaf = parameter_tree.leaf("input_factors").map_err(RHTLinearWrapperError::ParameterError)?;
 
-        if input_factors_raw.shape() != [input_dimension] {
+        if input_factors_leaf.shape() != [input_dimension] {
             return Err(RHTLinearWrapperError::InputFactorsShapeMismatch {
                 expected_dimension: input_dimension,
-                actual_shape: input_factors_raw.shape().into(),
+                actual_shape: input_factors_leaf.shape().into(),
             });
         }
 
-        let output_factors_raw =
-            parameter_tree.leaf_array("output_factors").map_err(RHTLinearWrapperError::ParameterError)?;
+        let output_factors_leaf =
+            parameter_tree.leaf("output_factors").map_err(RHTLinearWrapperError::ParameterError)?;
 
-        if output_factors_raw.shape() != [output_dimension] {
+        if output_factors_leaf.shape() != [output_dimension] {
             return Err(RHTLinearWrapperError::OutputFactorsShapeMismatch {
                 expected_dimension: output_dimension,
-                actual_shape: output_factors_raw.shape().into(),
+                actual_shape: output_factors_leaf.shape().into(),
             });
         }
 
-        let input_factors = convert_int32_factors_to_kernel_type(context, &input_factors_raw, kernel_data_type);
-        let output_factors = convert_int32_factors_to_kernel_type(context, &output_factors_raw, kernel_data_type);
+        let input_factors_buffer = input_factors_leaf.read_buffer().map_err(RHTLinearWrapperError::ParameterError)?;
+        let output_factors_buffer = output_factors_leaf.read_buffer().map_err(RHTLinearWrapperError::ParameterError)?;
 
-        let input_hadamard_kernel = <B::Kernels as Kernels>::HadamardTransformMulKernel::new(context, kernel_data_type)
+        let input_hadamard_kernel = <B::Kernels as Kernels>::HadamardTransformKernel::new(context, kernel_data_type)
             .map_err(RHTLinearWrapperError::BackendError)?;
 
-        let output_hadamard_kernel =
-            <B::Kernels as Kernels>::HadamardTransformMulKernel::new(context, kernel_data_type)
-                .map_err(RHTLinearWrapperError::BackendError)?;
+        let output_hadamard_kernel = <B::Kernels as Kernels>::HadamardTransformKernel::new(context, kernel_data_type)
+            .map_err(RHTLinearWrapperError::BackendError)?;
 
         let inner_linear_tree =
             parameter_tree.subtree("inner_linear").map_err(RHTLinearWrapperError::ParameterError)?;
 
-        let input_factors_buffer_rc = input_factors.buffer();
-
-        let (inner_linear, output_fused, prefill_fused) = match inner_config {
+        let (inner_linear, fused_output_hadamard) = match inner_config {
             LinearConfig::Quantized(q) | LinearConfig::MLXQuantized(q) => {
                 let ql = QuantizedLinear::new(
                     context,
@@ -245,17 +180,10 @@ impl<B: Backend> RHTLinearWrapper<B> {
                     RHTLinearWrapperError::InnerLinearError(Box::new(super::LinearBlockError::QuantizedLinearError(e)))
                 })?;
 
-                let out_fused = try_create_output_fused_from_quantized(
-                    context,
-                    inner_config,
-                    &ql,
-                    input_dimension,
-                    output_dimension,
-                );
+                let fused =
+                    try_create_fused_output_hadamard(context, inner_config, &ql, input_dimension, output_dimension);
 
-                let pf_fused = try_create_prefill_fused_from_quantized(context, inner_config, &ql, output_dimension);
-
-                (Box::new(ql) as Box<dyn Linear<B>>, out_fused, pf_fused)
+                (Box::new(ql) as Box<dyn Linear<B>>, fused)
             },
             _ => {
                 let inner = <dyn Linear<B>>::new(
@@ -269,51 +197,25 @@ impl<B: Backend> RHTLinearWrapper<B> {
                     output_array_id,
                 )
                 .map_err(|error| RHTLinearWrapperError::InnerLinearError(Box::new(error)))?;
-                (inner, None, None)
+                (inner, None)
             },
         };
 
         Ok(Self {
             inner_linear,
-            input_hadamard: Some((input_hadamard_kernel, input_factors_buffer_rc)),
+            input_hadamard: Some((input_hadamard_kernel, input_factors_buffer)),
             output_hadamard_kernel,
-            output_factors_buffer: output_factors.buffer(),
+            output_factors_buffer,
             input_dimension,
             output_dimension,
             input_array_id,
             output_array_id,
-            output_fused,
-            prefill_fused,
+            fused_output_hadamard,
         })
     }
 
-    pub fn take_input_hadamard_factors(&mut self) -> Option<Rc<RefCell<B::Buffer>>> {
+    pub fn take_input_hadamard_factors(&mut self) -> Option<B::Buffer> {
         self.input_hadamard.take().map(|(_, factors)| factors)
-    }
-}
-
-pub fn convert_int32_factors_to_kernel_type<B: Backend>(
-    context: &B::Context,
-    source_array: &Array<B>,
-    target_data_type: DataType,
-) -> Array<B> {
-    let int32_values = source_array.as_slice::<i32>();
-
-    match target_data_type {
-        DataType::BF16 => {
-            let converted: Vec<bf16> = int32_values.iter().map(|&value| bf16::from_f32(value as f32)).collect();
-            context.create_array_from(source_array.shape(), &converted, "rht_factors")
-        },
-        DataType::F16 => {
-            let converted: Vec<half::f16> =
-                int32_values.iter().map(|&value| half::f16::from_f32(value as f32)).collect();
-            context.create_array_from(source_array.shape(), &converted, "rht_factors")
-        },
-        DataType::F32 => {
-            let converted: Vec<f32> = int32_values.iter().map(|&value| value as f32).collect();
-            context.create_array_from(source_array.shape(), &converted, "rht_factors")
-        },
-        other => panic!("Unsupported kernel data type for RHT factors: {other:?}"),
     }
 }
 
@@ -323,103 +225,43 @@ impl<B: Backend> Linear<B> for RHTLinearWrapper<B> {
         state: &mut ForwardPassState<B>,
         encoder: &mut Encoder<B>,
     ) -> Result<(), B::Error> {
-        let batch_size = state.active_suffix_length();
+        let batch_size = state.active_row_count();
 
         // Input Hadamard (standalone dispatch, or skipped if fused into preceding norm)
         if let Some((ref kernel, ref factors_buffer)) = self.input_hadamard {
-            let input_total_blocks = (batch_size * self.input_dimension / 32) as u32;
             let input_array = state.array(self.input_array_id);
             kernel.encode(
                 input_array.buffer().borrow_mut().deref_mut(),
-                factors_buffer.borrow().deref(),
-                input_total_blocks,
+                factors_buffer,
                 self.input_dimension as u32,
+                batch_size as u32,
                 encoder,
             );
         }
 
-        // QMV + Output Hadamard: fused for decode, separate for prefill
-        if batch_size < 32 {
-            if let Some(ref out_fused) = self.output_fused {
-                let input_array = state.array(self.input_array_id);
-                let output_array = state.array(self.output_array_id);
-
-                let w_borrow = out_fused.weights_buffer.borrow();
-                let s_borrow = out_fused.scales_buffer.borrow();
-                let zp_borrow = out_fused.zero_points_or_biases_buffer.borrow();
-                let in_buf_rc = input_array.buffer();
-                let in_borrow = in_buf_rc.borrow();
-                let out_buf_rc = output_array.buffer();
-                let mut out_borrow = out_buf_rc.borrow_mut();
-                let of_borrow = self.output_factors_buffer.borrow();
-
-                let zp_opt: Option<&B::Buffer> = if !out_fused.is_mlx_quant {
-                    Some(zp_borrow.deref())
-                } else {
-                    None
-                };
-                let bias_opt: Option<&B::Buffer> = if out_fused.is_mlx_quant {
-                    Some(zp_borrow.deref())
-                } else {
-                    None
-                };
-
-                out_fused.kernel.encode(
-                    w_borrow.deref(),
-                    s_borrow.deref(),
-                    zp_opt,
-                    bias_opt,
-                    in_borrow.deref(),
-                    out_borrow.deref_mut(),
-                    of_borrow.deref(),
-                    self.input_dimension as i32,
-                    self.output_dimension as i32,
-                    batch_size as i32,
-                    encoder,
-                );
-
-                return Ok(());
-            }
-        }
-
-        // Prefill fused path: QMM + Output Hadamard in one kernel
-        if let Some(ref pf_fused) = self.prefill_fused {
+        // Fused matmul + output Hadamard (handles both decode and prefill batch sizes)
+        if let Some(ref fused) = self.fused_output_hadamard {
             let input_array = state.array(self.input_array_id);
             let output_array = state.array(self.output_array_id);
-
-            let w_borrow = pf_fused.weights_buffer.borrow();
-            let s_borrow = pf_fused.scales_buffer.borrow();
-            let zp_borrow = pf_fused.zero_points_or_biases_buffer.borrow();
             let in_buf_rc = input_array.buffer();
-            let in_borrow = in_buf_rc.borrow();
             let out_buf_rc = output_array.buffer();
-            let mut out_borrow = out_buf_rc.borrow_mut();
-            let of_borrow = self.output_factors_buffer.borrow();
 
-            let zp_opt: Option<&B::Buffer> = if !pf_fused.is_mlx_quant {
-                Some(zp_borrow.deref())
-            } else {
-                None
-            };
-            let bias_opt: Option<&B::Buffer> = if pf_fused.is_mlx_quant {
-                Some(zp_borrow.deref())
-            } else {
-                None
-            };
-
-            pf_fused.kernel.encode(
-                w_borrow.deref(),
-                s_borrow.deref(),
-                zp_opt,
-                bias_opt,
-                in_borrow.deref(),
-                out_borrow.deref_mut(),
-                of_borrow.deref(),
-                self.input_dimension as i32,
-                self.output_dimension as i32,
-                batch_size as i32,
-                encoder,
-            );
+            fused
+                .kernel
+                .encode(
+                    encoder,
+                    QuantizedMatmulArguments {
+                        a_buffer: in_buf_rc.borrow().deref(),
+                        a_offset: 0,
+                        b_buffer: fused.weights_buffer.borrow().deref(),
+                        scales_buffer: fused.scales_buffer.borrow().deref(),
+                        zero_points_or_biases_buffer: fused.zero_points_or_biases_buffer.borrow().deref(),
+                        output_buffer: out_buf_rc.borrow_mut().deref_mut(),
+                        hadamard_factors: Some(&self.output_factors_buffer),
+                        batch_dim: batch_size,
+                    },
+                )
+                .expect("Fused output hadamard matmul encode failed");
 
             return Ok(());
         }
@@ -428,13 +270,12 @@ impl<B: Backend> Linear<B> for RHTLinearWrapper<B> {
         self.inner_linear.encode(state, encoder)?;
 
         {
-            let output_total_blocks = (batch_size * self.output_dimension / 32) as u32;
             let output_array = state.array(self.output_array_id);
             self.output_hadamard_kernel.encode(
                 output_array.buffer().borrow_mut().deref_mut(),
-                self.output_factors_buffer.borrow().deref(),
-                output_total_blocks,
+                &self.output_factors_buffer,
                 self.output_dimension as u32,
+                batch_size as u32,
                 encoder,
             );
         }

@@ -3,6 +3,7 @@
 #include "../common/dsl.h"
 #include "../common/thread_context.h"
 #include "../common/threadgroup_reduce.h"
+#include "../hadamard_transform/hadamard_transform.h"
 
 using namespace metal;
 
@@ -19,13 +20,16 @@ PUBLIC KERNEL(RMSNormHadamardMul)(
     const device InputT* input OPTIONAL(!in_place),
     const device ScaleT* scales,
     device OutputT* output,
-    const device OutputT* hadamard_factors,
+    device InputT* shortcut_buffer OPTIONAL(copy_to_shortcut),
+    const device int32_t* hadamard_factors,
     constant uint& batch_size,
     constant uint& element_count,
     constant float& epsilon,
     constant float& scale_offset,
     constant bool& full_layer,
     const bool in_place SPECIALIZE,
+    const bool copy_to_shortcut SPECIALIZE,
+    const bool residual_add SPECIALIZE,
     threadgroup float staging[STAGING_SIZE],
     const ThreadContext thread_context,
     const uint batch_idx GROUPS(batch_size),
@@ -53,7 +57,18 @@ PUBLIC KERNEL(RMSNormHadamardMul)(
     AccumT vals[GRAIN_SIZE];
     for (uint j = 0; j < GRAIN_SIZE; ++j) {
       uint i = base_i + j;
-      vals[j] = (i < element_count) ? static_cast<AccumT>(input_data[i]) : 0.0f;
+      if (i < element_count) {
+        InputT val = input_data[i];
+        if (copy_to_shortcut) {
+          if (residual_add) {
+            val = val + shortcut_buffer[input_offset + i];
+          }
+          shortcut_buffer[input_offset + i] = val;
+        }
+        vals[j] = static_cast<AccumT>(val);
+      } else {
+        vals[j] = 0.0f;
+      }
       if (i < element_count)
         staging[i] = float(vals[j]);
     }
@@ -62,12 +77,12 @@ PUBLIC KERNEL(RMSNormHadamardMul)(
     }
   }
 
-  AccumT total_sum = threadgroup_cooperative_reduce_sum<BLOCK_SIZE>(
-      partial_sum,
-      shared_sum,
-      thread_in_row,
-      thread_context
-  );
+  AccumT total_sum =
+      threadgroup_cooperative_reduce<SimdReduceSum<AccumT>, BLOCK_SIZE>(
+          partial_sum,
+          shared_sum,
+          thread_context
+      );
 
   AccumT mean_square =
       static_cast<AccumT>(total_sum) / static_cast<AccumT>(element_count);
@@ -121,15 +136,10 @@ PUBLIC KERNEL(RMSNormHadamardMul)(
   for (uint block = simd_group_id; block < total_blocks;
        block += total_simd_groups) {
     uint elem_idx = block * METAL_SIMD_SIZE + lane;
-
-    float value = staging[elem_idx] * float(hadamard_factors[elem_idx]);
-
-    for (uint stride = 1; stride < METAL_SIMD_SIZE; stride <<= 1) {
-      float partner = simd_shuffle_xor(value, static_cast<ushort>(stride));
-      value = (lane & stride) ? (partner - value) : (partner + value);
-    }
-
-    constexpr float normalization_factor = 1.0f / 5.656854249f;
-    output_data[elem_idx] = OutputT(value * normalization_factor);
+    output_data[elem_idx] = OutputT(simdgroup_random_hadamard_transform(
+        static_cast<ushort>(lane),
+        staging[elem_idx],
+        hadamard_factors[elem_idx]
+    ));
   }
 }

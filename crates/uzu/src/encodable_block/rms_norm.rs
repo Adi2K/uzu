@@ -32,6 +32,7 @@ pub struct RMSNorm<B: Backend> {
     config: NormalizationConfig,
     input_array_id: ArrayId,
     output_array_id: ArrayId,
+    shortcut_array_id: Option<ArrayId>,
     scales_buffer: Rc<RefCell<B::Buffer>>,
     use_sampling_range: bool,
 }
@@ -44,6 +45,8 @@ impl<B: Backend> RMSNorm<B> {
         input_array_id: ArrayId,
         output_array_id: ArrayId,
         parameter_tree: &ParameterTree<B::Context>,
+        shortcut_array_id: Option<ArrayId>,
+        residual_add: bool,
     ) -> Result<Self, RMSNormError<B>> {
         let scales = parameter_tree.leaf_array("scales").map_err(RMSNormError::ParameterError)?;
 
@@ -62,6 +65,8 @@ impl<B: Backend> RMSNorm<B> {
             output_type,
             accumulation_data_type,
             input_array_id == output_array_id,
+            shortcut_array_id.is_some(),
+            residual_add,
         )
         .map_err(RMSNormError::BackendError)?;
 
@@ -70,6 +75,7 @@ impl<B: Backend> RMSNorm<B> {
             config,
             input_array_id,
             output_array_id,
+            shortcut_array_id,
             scales_buffer: scales.buffer(),
             use_sampling_range: false,
         })
@@ -99,7 +105,7 @@ impl<B: Backend> RMSNorm<B> {
         let (batch_start, batch_len) = if self.use_sampling_range {
             (state.sampling_start(), state.sampling_length())
         } else {
-            (0, state.active_suffix_length())
+            (0, state.active_row_count())
         };
 
         let batch_len = batch_len.min(suffix_length.saturating_sub(batch_start));
@@ -116,10 +122,14 @@ impl<B: Backend> RMSNorm<B> {
         let input_buffer = (self.input_array_id != self.output_array_id).then(|| input_array.buffer());
         let input_buffer_borrow = input_buffer.as_ref().map(|b| b.borrow());
 
+        let shortcut_rc = self.shortcut_array_id.map(|id| state.array(id).buffer());
+        let mut shortcut_borrow = shortcut_rc.as_ref().map(|rc| rc.borrow_mut());
+
         self.kernel.encode(
             input_buffer_borrow.as_deref().map(|b| (b, input_offset)),
             self.scales_buffer.borrow().deref(),
             (output_array.buffer().borrow_mut().deref_mut(), output_offset),
+            shortcut_borrow.as_deref_mut().map(|b| (b, input_offset)),
             batch_len as u32,
             element_count as u32,
             self.config.epsilon,

@@ -20,7 +20,8 @@ pub fn rms_norm_hadamard_mul<
     input: Option<*const InputT>,
     #[allow(unused)] scales: *const ScaleT,
     #[allow(unused)] output: *mut OutputT,
-    #[allow(unused)] hadamard_factors: *const OutputT,
+    #[optional(copy_to_shortcut)] shortcut_buffer: Option<*mut InputT>,
+    #[allow(unused)] hadamard_factors: *const i32,
     #[allow(unused)] batch_size: u32,
     #[allow(unused)] element_count: u32,
     #[allow(unused)] epsilon: f32,
@@ -29,6 +30,8 @@ pub fn rms_norm_hadamard_mul<
     #[specialize]
     #[allow(unused)]
     in_place: bool,
+    #[specialize] copy_to_shortcut: bool,
+    #[specialize] residual_add: bool,
 ) {
     todo!()
 }

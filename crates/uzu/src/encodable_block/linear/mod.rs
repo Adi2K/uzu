@@ -3,8 +3,6 @@ mod qlora_wrapper;
 mod quantized;
 mod rht_wrapper;
 
-use std::{cell::RefCell, rc::Rc};
-
 pub use full_precision::{FullPrecisionLinear, FullPrecisionLinearError};
 pub use qlora_wrapper::{QLoRALinearWrapper, QLoRALinearWrapperError};
 pub use quantized::{QuantizedLinear, QuantizedLinearError};
@@ -123,7 +121,7 @@ impl<B: Backend> dyn Linear<B> {
         parameter_tree: &ParameterTree<B::Context>,
         input_array_id: ArrayId,
         output_array_id: ArrayId,
-    ) -> Result<(Box<dyn Linear<B>>, Option<Rc<RefCell<B::Buffer>>>), LinearBlockError<B>> {
+    ) -> Result<(Box<dyn Linear<B>>, Option<B::Buffer>), LinearBlockError<B>> {
         let output_dimension_sum: usize = output_dimensions.iter().sum();
         match config {
             LinearConfig::RHTLinearWrapper {

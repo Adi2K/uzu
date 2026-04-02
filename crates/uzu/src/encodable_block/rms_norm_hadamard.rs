@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    ops::{Deref, DerefMut},
-    rc::Rc,
-};
+use std::ops::DerefMut;
 
 use thiserror::Error;
 
@@ -30,8 +26,9 @@ pub struct RMSNormHadamard<B: Backend> {
     config: NormalizationConfig,
     input_array_id: ArrayId,
     output_array_id: ArrayId,
-    scales_buffer: Rc<RefCell<B::Buffer>>,
-    pub(crate) hadamard_factors_buffer: Rc<RefCell<B::Buffer>>,
+    shortcut_array_id: Option<ArrayId>,
+    scales_buffer: B::Buffer,
+    hadamard_factors_buffer: B::Buffer,
 }
 
 impl<B: Backend> RMSNormHadamard<B> {
@@ -42,9 +39,15 @@ impl<B: Backend> RMSNormHadamard<B> {
         input_array_id: ArrayId,
         output_array_id: ArrayId,
         norm_parameter_tree: &ParameterTree<B::Context>,
-        hadamard_factors_buffer: Rc<RefCell<B::Buffer>>,
+        hadamard_factors_buffer: B::Buffer,
+        shortcut_array_id: Option<ArrayId>,
+        residual_add: bool,
     ) -> Result<Self, RMSNormHadamardError<B>> {
-        let scales = norm_parameter_tree.leaf_array("scales").map_err(RMSNormHadamardError::ParameterError)?;
+        let scales = norm_parameter_tree
+            .leaf("scales")
+            .map_err(RMSNormHadamardError::ParameterError)?
+            .read_buffer()
+            .map_err(RMSNormHadamardError::ParameterError)?;
 
         let accumulation_data_type: DataType = config.accumulation_precision.into();
         let scale_data_type: DataType = config.scale_precision.into();
@@ -61,6 +64,8 @@ impl<B: Backend> RMSNormHadamard<B> {
             output_type,
             accumulation_data_type,
             input_array_id == output_array_id,
+            shortcut_array_id.is_some(),
+            residual_add,
         )
         .map_err(RMSNormHadamardError::BackendError)?;
 
@@ -69,7 +74,8 @@ impl<B: Backend> RMSNormHadamard<B> {
             config,
             input_array_id,
             output_array_id,
-            scales_buffer: scales.buffer(),
+            shortcut_array_id,
+            scales_buffer: scales,
             hadamard_factors_buffer,
         })
     }
@@ -87,7 +93,7 @@ impl<B: Backend> RMSNormHadamard<B> {
         let input_elem_size = input_array.data_type().size_in_bytes();
         let output_elem_size = output_array.data_type().size_in_bytes();
 
-        let (batch_start, batch_len) = (0, state.active_suffix_length());
+        let (batch_start, batch_len) = (0, state.active_row_count());
         let batch_len = batch_len.min(suffix_length.saturating_sub(batch_start));
         if batch_len == 0 {
             return Ok(());
@@ -102,11 +108,15 @@ impl<B: Backend> RMSNormHadamard<B> {
         let input_buffer = (self.input_array_id != self.output_array_id).then(|| input_array.buffer());
         let input_buffer_borrow = input_buffer.as_ref().map(|b| b.borrow());
 
+        let shortcut_rc = self.shortcut_array_id.map(|id| state.array(id).buffer());
+        let mut shortcut_borrow = shortcut_rc.as_ref().map(|rc| rc.borrow_mut());
+
         self.kernel.encode(
             input_buffer_borrow.as_deref().map(|b| (b, input_offset)),
-            self.scales_buffer.borrow().deref(),
+            &self.scales_buffer,
             (output_array.buffer().borrow_mut().deref_mut(), output_offset),
-            self.hadamard_factors_buffer.borrow().deref(),
+            shortcut_borrow.as_deref_mut(),
+            &self.hadamard_factors_buffer,
             batch_len as u32,
             input_shape[1] as u32,
             self.config.epsilon,

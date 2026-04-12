@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    ConfigError, DecoderConfig, DecoderLayerConfig, DecoderLayerType, EmbeddingConfig, GenerationConfig,
-    MessageProcessorConfig, MixerConfig, TransformerConfig,
+    AttentionConfig, ConfigDataType, ConfigError, DecoderConfig, DecoderLayerConfig, DecoderLayerType, EmbeddingConfig,
+    GenerationConfig, MessageProcessorConfig, MixerConfig, NormalizationConfig, TransformerConfig, UpcastMode,
 };
 
 struct AttentionDims {
@@ -12,32 +12,111 @@ struct AttentionDims {
     attention_scale: Option<f32>,
 }
 
-/// Inner model config matching the new lalamo export format.
-/// Contains embedding_config at the top level, with transformer_config nested.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PLEModelConfig {
+    #[serde(default)]
+    pub ple_dim: Option<usize>,
+    #[serde(default)]
+    pub ple_embed_scale: Option<f32>,
+    #[serde(default)]
+    pub model_projection_scale: Option<f32>,
+    #[serde(default)]
+    pub input_scale: Option<f32>,
+    #[serde(default, alias = "linear_config")]
+    pub ple_linear_config: Option<crate::config::LinearConfig>,
+    #[serde(default, alias = "norm_config")]
+    pub ple_norm_config: Option<NormalizationConfig>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct InnerModelConfig {
     pub embedding_config: EmbeddingConfig,
     pub transformer_config: TransformerConfig,
     pub vocab_size: usize,
+    #[serde(default)]
+    pub hidden_dims: Option<Box<[usize]>>,
+    #[serde(default)]
+    pub kv_shared_layer_sources: Option<Box<[Option<usize>]>>,
+    #[serde(default)]
+    pub ple_dim: Option<usize>,
+    #[serde(default)]
+    pub ple_embed_scale: Option<f32>,
+    #[serde(default)]
+    pub ple_projection_scale: Option<f32>,
+    #[serde(default)]
+    pub ple_combination_scale: Option<f32>,
+    #[serde(default)]
+    pub ple_linear_config: Option<crate::config::LinearConfig>,
+    #[serde(default)]
+    pub ple_norm_config: Option<NormalizationConfig>,
+    #[serde(default)]
+    pub has_layer_scalar: bool,
+
+    #[serde(default)]
+    pub ple_model_config: Option<PLEModelConfig>,
 }
 
 impl InnerModelConfig {
-    /// Convert to DecoderConfig for backward compatibility with the rest of the codebase.
+    /// Construct a default V-norm config for `normalize_values == true`.
+    fn default_value_norm_config() -> NormalizationConfig {
+        NormalizationConfig {
+            scale_precision: ConfigDataType::BFloat16,
+            accumulation_precision: ConfigDataType::Float32,
+            epsilon: 1e-6,
+            scale_offset: None,
+            upcast_mode: UpcastMode::OnlyNormalization,
+            subtract_mean: false,
+            use_bias: false,
+            has_scale: false,
+        }
+    }
+
+    fn apply_mixer_conversions(
+        mixer: &MixerConfig,
+        tf: &TransformerConfig,
+    ) -> MixerConfig {
+        match mixer {
+            MixerConfig::Attention(attn) => MixerConfig::Attention(AttentionConfig {
+                value_norm_config: if attn.normalize_values && attn.value_norm_config.is_none() {
+                    Some(Self::default_value_norm_config())
+                } else {
+                    attn.value_norm_config.clone()
+                },
+                partial_rope_dim: attn.partial_rope_dim.or_else(|| {
+                    if attn.sliding_window_size.is_none() {
+                        tf.global_rope_dim
+                    } else {
+                        None
+                    }
+                }),
+                ..attn.clone()
+            }),
+            other => other.clone(),
+        }
+    }
+
     pub fn to_decoder_config(&self) -> Result<DecoderConfig, ConfigError> {
         let tf = &self.transformer_config;
+        let ple = self.ple_model_config.as_ref();
 
         let first_layer = tf.layer_configs.first().ok_or(ConfigError::NoLayers)?;
+
+        let first_mixer = Self::apply_mixer_conversions(&first_layer.mixer_config, tf);
+
+        let first_layer_has_scalar = self.has_layer_scalar
+            || first_layer.ple_config.as_ref().is_some_and(|p| p.has_layer_scalar);
 
         let layer_config = DecoderLayerConfig {
             pre_attention_norm_config: first_layer
                 .pre_attention_norm_config
                 .clone()
                 .unwrap_or_else(|| tf.output_norm_config.clone()),
-            mixer_config: first_layer.mixer_config.clone(),
+            mixer_config: first_mixer,
             post_attention_norm_config: first_layer.post_attention_norm_config.clone(),
             pre_mlp_norm_config: first_layer.pre_mlp_norm_config.clone(),
             mlp_config: first_layer.mlp_config.clone(),
             post_mlp_norm_config: first_layer.post_mlp_norm_config.clone(),
+            has_layer_scalar: first_layer_has_scalar,
         };
 
         let attention_dims = Self::derive_attention_dims(tf)?;
@@ -60,19 +139,62 @@ impl InnerModelConfig {
         let layer_configs: Box<[DecoderLayerConfig]> = tf
             .layer_configs
             .iter()
-            .map(|layer| DecoderLayerConfig {
-                pre_attention_norm_config: layer
-                    .pre_attention_norm_config
-                    .clone()
-                    .unwrap_or_else(|| tf.output_norm_config.clone()),
-                mixer_config: layer.mixer_config.clone(),
-                post_attention_norm_config: layer.post_attention_norm_config.clone(),
-                pre_mlp_norm_config: layer.pre_mlp_norm_config.clone(),
-                mlp_config: layer.mlp_config.clone(),
-                post_mlp_norm_config: layer.post_mlp_norm_config.clone(),
+            .map(|layer| {
+                let mixer = Self::apply_mixer_conversions(&layer.mixer_config, tf);
+                let layer_has_scalar = self.has_layer_scalar
+                    || layer.ple_config.as_ref().is_some_and(|p| p.has_layer_scalar);
+                DecoderLayerConfig {
+                    pre_attention_norm_config: layer
+                        .pre_attention_norm_config
+                        .clone()
+                        .unwrap_or_else(|| tf.output_norm_config.clone()),
+                    mixer_config: mixer,
+                    post_attention_norm_config: layer.post_attention_norm_config.clone(),
+                    pre_mlp_norm_config: layer.pre_mlp_norm_config.clone(),
+                    mlp_config: layer.mlp_config.clone(),
+                    post_mlp_norm_config: layer.post_mlp_norm_config.clone(),
+                    has_layer_scalar: layer_has_scalar,
+                }
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+
+        let hidden_dims = self.hidden_dims.clone().or_else(|| {
+            let per_layer: Vec<usize> = tf.layer_configs.iter().filter_map(|l| l.hidden_dim).collect();
+            if per_layer.len() == tf.layer_configs.len() && !per_layer.is_empty() {
+                Some(per_layer.into_boxed_slice())
+            } else {
+                None
+            }
+        });
+
+        if let Some(ref dims) = hidden_dims {
+            if dims.len() != num_layers {
+                return Err(ConfigError::MissingField(format!(
+                    "hidden_dims length ({}) must equal num_layers ({})",
+                    dims.len(),
+                    num_layers
+                )));
+            }
+        }
+
+        let kv_shared_layer_sources = self.kv_shared_layer_sources.clone().or_else(|| {
+            let has_any = tf.layer_configs.iter().any(|l| l.kv_source_layer.is_some());
+            if has_any {
+                let sources: Vec<Option<usize>> = tf.layer_configs.iter().map(|l| l.kv_source_layer).collect();
+                Some(sources.into_boxed_slice())
+            } else {
+                None
+            }
+        });
+
+        let ple_dim = self.ple_dim.or_else(|| ple.and_then(|p| p.ple_dim));
+        let ple_embed_scale = self.ple_embed_scale.or_else(|| ple.and_then(|p| p.ple_embed_scale));
+        let ple_projection_scale = self.ple_projection_scale.or_else(|| ple.and_then(|p| p.model_projection_scale));
+        let ple_combination_scale = self.ple_combination_scale.or_else(|| ple.and_then(|p| p.input_scale));
+        let ple_linear_config =
+            self.ple_linear_config.clone().or_else(|| ple.and_then(|p| p.ple_linear_config.clone()));
+        let ple_norm_config = self.ple_norm_config.clone().or_else(|| ple.and_then(|p| p.ple_norm_config.clone()));
 
         Ok(DecoderConfig {
             embedding_config: self.embedding_config.clone(),
@@ -90,8 +212,16 @@ impl InnerModelConfig {
             attention_scale: attention_dims.attention_scale,
             num_layers,
             sliding_window_sizes: Some(sliding_window_sizes),
+            hidden_dims,
             layer_types: Some(layer_types),
             context_length: tf.context_length,
+            kv_shared_layer_sources,
+            ple_dim,
+            ple_embed_scale,
+            ple_projection_scale,
+            ple_combination_scale,
+            ple_linear_config,
+            ple_norm_config,
         })
     }
 
@@ -176,8 +306,6 @@ pub struct LanguageModelConfig {
 }
 
 impl LanguageModelConfig {
-    /// Get the decoder config for backward compatibility.
-    /// This converts the new format to the old DecoderConfig format.
     pub fn decoder_config(&self) -> Result<DecoderConfig, ConfigError> {
         self.model_config.to_decoder_config()
     }

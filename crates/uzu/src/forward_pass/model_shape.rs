@@ -133,7 +133,7 @@ impl ModelShape {
                     let hd = attn.head_dim.unwrap_or(decoder_config.head_dim);
                     let nh = attn.num_heads.unwrap_or(decoder_config.num_heads);
                     let ng = attn.num_groups.unwrap_or(decoder_config.num_groups);
-                    let rope_dim = attn.partial_rope_dim.unwrap_or(hd);
+                    let rope_dim = hd;
                     max_rope_dim = max_rope_dim.max(rope_dim);
                     if attn.sliding_window_size.is_some() {
                         local_rope_dim = local_rope_dim.max(rope_dim);

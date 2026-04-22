@@ -22,4 +22,16 @@ pub struct TransformerConfig {
     #[serde(default)]
     pub num_layers: Option<usize>,
     pub context_length: usize,
+
+    /// Used to derive partial_rope_dim for global (non-sliding-window) attention layers.
+    #[serde(default)]
+    pub global_rope_dim: Option<usize>,
+
+    /// Deserialized for forward compatibility; not used in conversion.
+    #[serde(default)]
+    pub local_rope_dim: Option<usize>,
+
+    /// Deserialized for forward compatibility; per-layer head_dim from AttentionConfig is used instead.
+    #[serde(default)]
+    pub global_head_dim: Option<usize>,
 }
